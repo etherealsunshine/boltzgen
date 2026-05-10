@@ -60,6 +60,35 @@ def _autocast_context(device: torch.device, precision: str):
     return torch.autocast(device_type="cuda", dtype=dtype)
 
 
+def _design_token_count(batch: dict) -> int:
+    valid_mask = batch["token_pad_mask"].bool()
+    design_mask = batch["design_mask"].bool() & valid_mask
+    return int(design_mask.sum().item())
+
+
+def _next_usable_batch(
+    loader_iter,
+    data_module: TrainingDataModule,
+    device: torch.device,
+    *,
+    min_design_tokens: int,
+    max_attempts: int,
+) -> tuple[dict, int]:
+    skipped = 0
+    for _ in range(max_attempts):
+        batch = next(loader_iter)
+        batch = data_module.transfer_batch_to_device(batch, device, dataloader_idx=0)
+        batch = _clone_batch(batch)
+        if _design_token_count(batch) >= min_design_tokens:
+            return batch, skipped
+        skipped += 1
+
+    raise RuntimeError(
+        f"Could not find a batch with at least {min_design_tokens} design tokens "
+        f"after {max_attempts} attempts. Try lowering --min-design-tokens."
+    )
+
+
 def _make_data_config(cfg: OmegaConf, args: argparse.Namespace):
     cfg.data.batch_size = 1
     cfg.data.num_workers = args.num_workers
@@ -147,13 +176,21 @@ def _evaluate(
     batches: int,
     loss_mask: str,
     precision: str,
+    min_design_tokens: int,
+    max_attempts: int,
 ) -> dict[str, float]:
     totals: dict[str, float] = {}
+    skipped_total = 0
     model.train()  # BoltzGen uses training=True path to avoid reverse sampling.
     for _ in range(batches):
-        batch = next(loader_iter)
-        batch = data_module.transfer_batch_to_device(batch, device, dataloader_idx=0)
-        batch = _clone_batch(batch)
+        batch, skipped = _next_usable_batch(
+            loader_iter,
+            data_module,
+            device,
+            min_design_tokens=min_design_tokens,
+            max_attempts=max_attempts,
+        )
+        skipped_total += skipped
         _, metrics, _ = _forward_loss(
             model,
             batch,
@@ -162,7 +199,9 @@ def _evaluate(
         )
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + value
-    return {f"eval_{key}": value / batches for key, value in totals.items()}
+    averaged = {f"eval_{key}": value / batches for key, value in totals.items()}
+    averaged["eval_skipped_batches"] = float(skipped_total)
+    return averaged
 
 
 def _save_q_head(model: torch.nn.Module, output_dir: Path, step: int) -> Path:
@@ -195,6 +234,8 @@ def main() -> None:
     parser.add_argument("--max-atoms", type=int, default=2048)
     parser.add_argument("--max-seqs", type=int, default=1024)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--min-design-tokens", type=int, default=32)
+    parser.add_argument("--max-batch-attempts", type=int, default=100)
     parser.add_argument("--loss-mask", choices=["design", "valid"], default="design")
     parser.add_argument("--no-msa", action="store_true")
     args = parser.parse_args()
@@ -230,6 +271,7 @@ def main() -> None:
     print(f"precision:       {args.precision if device.type == 'cuda' else 'fp32'}")
     print(f"steps:           {args.steps}")
     print(f"loss_mask:       {args.loss_mask}")
+    print(f"min_design:      {args.min_design_tokens}")
     print(f"max_tokens:      {args.max_tokens}")
     print(f"max_atoms:       {args.max_atoms}")
     print(f"missing keys:    {len(incompatible.missing_keys)}")
@@ -245,6 +287,7 @@ def main() -> None:
         "acc_design",
         "tokens",
         "design_tokens",
+        "skipped_batches",
         "elapsed_sec",
     ]
     with metrics_path.open("w", newline="") as handle:
@@ -254,9 +297,13 @@ def main() -> None:
     start = time.time()
     last_logits = None
     for step in range(args.steps + 1):
-        batch = next(train_iter)
-        batch = data_module.transfer_batch_to_device(batch, device, dataloader_idx=0)
-        batch = _clone_batch(batch)
+        batch, skipped_batches = _next_usable_batch(
+            train_iter,
+            data_module,
+            device,
+            min_design_tokens=args.min_design_tokens,
+            max_attempts=args.max_batch_attempts,
+        )
 
         optimizer.zero_grad(set_to_none=True)
         loss, metrics, last_logits = _forward_loss(
@@ -276,7 +323,8 @@ def main() -> None:
                 f"acc_all={metrics['acc_all']:.3f} "
                 f"acc_design={metrics['acc_design']:.3f} "
                 f"tokens={int(metrics['tokens'])} "
-                f"design={int(metrics['design_tokens'])}"
+                f"design={int(metrics['design_tokens'])} "
+                f"skipped={skipped_batches}"
             )
             with metrics_path.open("a", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -285,6 +333,7 @@ def main() -> None:
                         "step": step,
                         "split": "train",
                         **metrics,
+                        "skipped_batches": skipped_batches,
                         "elapsed_sec": elapsed,
                     }
                 )
@@ -299,11 +348,14 @@ def main() -> None:
                 batches=args.eval_batches,
                 loss_mask=args.loss_mask,
                 precision=args.precision,
+                min_design_tokens=args.min_design_tokens,
+                max_attempts=args.max_batch_attempts,
             )
             print(
                 f"fresh step={step:05d} loss={eval_metrics['eval_loss']:.4f} "
                 f"acc_all={eval_metrics['eval_acc_all']:.3f} "
-                f"acc_design={eval_metrics['eval_acc_design']:.3f}"
+                f"acc_design={eval_metrics['eval_acc_design']:.3f} "
+                f"skipped={int(eval_metrics['eval_skipped_batches'])}"
             )
             with metrics_path.open("a", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -316,6 +368,7 @@ def main() -> None:
                         "acc_design": eval_metrics["eval_acc_design"],
                         "tokens": eval_metrics["eval_tokens"],
                         "design_tokens": eval_metrics["eval_design_tokens"],
+                        "skipped_batches": eval_metrics["eval_skipped_batches"],
                         "elapsed_sec": elapsed,
                     }
                 )
