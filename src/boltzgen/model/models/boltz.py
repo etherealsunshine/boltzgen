@@ -1307,7 +1307,17 @@ class Boltz(LightningModule):
             pred_dict["token_masks"] = batch["token_pad_mask"]
             if "keys_dict_out" in self.predict_args:
                 for key in self.predict_args["keys_dict_out"]:
-                    pred_dict[key] = out[key]
+                    if key in out:
+                        pred_dict[key] = out[key]
+                    elif key == "res_type_logits" and out.get("res_type") is not None:
+                        pred_dict[key] = out["res_type"]
+                    elif key == "inverse_fold_logits" and out.get("logits") is not None:
+                        pred_dict[key] = out["logits"]
+                    else:
+                        raise KeyError(
+                            f"Requested output key {key!r}, but it is not present in "
+                            f"model outputs {sorted(out.keys())}."
+                        )
 
             # also save these keys for computing refolding metrics like scRMSD
             pred_dict["input_coords"] = batch["coords"]

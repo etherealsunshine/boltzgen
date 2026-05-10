@@ -394,6 +394,10 @@ class DesignWriter(BasePredictionWriter):
                     "token_resolved_mask": sample["token_resolved_mask"][token_mask].cpu().numpy(),
                     "binding_type": binding_type[token_mask].cpu().numpy(),
                 }
+                if "token_index" in sample:
+                    metadata_dict["token_index"] = (
+                        sample["token_index"][token_mask].cpu().numpy()
+                    )
 
                 # Add optional fields only if they have valid values (avoid None -> object array)
                 if "inverse_fold_design_mask" in sample:
@@ -407,6 +411,27 @@ class DesignWriter(BasePredictionWriter):
                     aa_mask = batch["aa_constraint_mask"][0]
                     if aa_mask.any():  # Only save if there are actual constraints
                         metadata_dict["aa_constraint_mask"] = aa_mask[token_mask].cpu().numpy()
+
+                # Experimental introspective-acceptance hooks.
+                # These are only present when requested through `keys_dict_out`;
+                # they let downstream POCs compare BoltzGen proposal logits (`q`)
+                # against inverse-folding / anchor logits (`p`) without affecting
+                # the CIF-writing path.
+                for pred_key, metadata_key in (
+                    ("res_type_logits", "res_type_logits"),
+                    ("inverse_fold_logits", "inverse_fold_logits"),
+                    ("logits", "inverse_fold_logits"),
+                ):
+                    if pred_key in prediction and prediction[pred_key] is not None:
+                        logits = prediction[pred_key]
+                        if isinstance(logits, torch.Tensor):
+                            logits = logits[0]
+                            if logits.shape[0] != token_mask.shape[0]:
+                                continue
+                            metadata_dict[metadata_key] = logits[
+                                token_mask
+                            ].detach().cpu().float().numpy()
+                        break
 
                 np.savez_compressed(metadata_path, **metadata_dict)
 
