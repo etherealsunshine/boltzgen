@@ -61,6 +61,15 @@ def _accuracy(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) ->
     return (pred[mask] == true[mask]).float().mean().item()
 
 
+def _clone_batch(batch: dict) -> dict:
+    """Clone tensor leaves because BoltzGen forward mutates some feature tensors."""
+
+    cloned = {}
+    for key, value in batch.items():
+        cloned[key] = value.clone() if torch.is_tensor(value) else value
+    return cloned
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -101,8 +110,12 @@ def main() -> None:
     )
     data_module = TrainingDataModule(data_cfg)
     loader = data_module.train_dataloader()
-    batch = next(iter(loader))
-    batch = data_module.transfer_batch_to_device(batch, device, dataloader_idx=0)
+    base_batch = next(iter(loader))
+    base_batch = data_module.transfer_batch_to_device(
+        base_batch,
+        device,
+        dataloader_idx=0,
+    )
 
     model = hydra.utils.instantiate(cfg.model)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -123,12 +136,13 @@ def main() -> None:
     print(f"missing keys:     {len(incompatible.missing_keys)}")
     print(f"unexpected keys:  {len(incompatible.unexpected_keys)}")
     print(f"q-head params:    {sum(p.numel() for p in q_params):,}")
-    print(f"tokens in batch:  {int(batch['token_pad_mask'].sum().item())}")
-    print(f"design tokens:    {int(batch['design_mask'].bool().sum().item())}")
+    print(f"tokens in batch:  {int(base_batch['token_pad_mask'].sum().item())}")
+    print(f"design tokens:    {int(base_batch['design_mask'].bool().sum().item())}")
 
     last_logits = None
     for step in range(args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
+        batch = _clone_batch(base_batch)
         out = model(
             batch,
             recycling_steps=0,
