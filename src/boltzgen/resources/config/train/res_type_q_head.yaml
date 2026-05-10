@@ -231,3 +231,24 @@ model:
     diffusion_samples: 1
     symmetry_correction: false
 
+  diffusion_process_args:
+    sigma_min: 0.0004
+    sigma_max: 160.0
+    sigma_data: 16.0
+    rho: 7
+    P_mean: -1.2
+    P_std: 1.5
+    gamma_0: 0.8
+    gamma_min: 1.0
+    noise_scale: 1.0
+    step_scale: 1.0
+    mse_rotational_alignment: true
+    coordinate_augmentation: true
+    alignment_reverse_diff: true
+    synchronize_sigmas: false
+
+  diffusion_loss_args:
+    add_smooth_lddt_loss: true
+    add_bond_loss: false
+    nucleotide_loss_weight: 5.0
+    ligand_loss_weight: 10.0
