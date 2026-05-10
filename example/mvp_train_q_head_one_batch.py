@@ -86,6 +86,10 @@ def main() -> None:
     cfg.data.samples_per_epoch = 1
     cfg.data.max_tokens = min(int(cfg.data.max_tokens), 256)
     cfg.data.max_atoms = min(int(cfg.data.max_atoms), 2048)
+    cfg.data.val_batch_size = 1
+    cfg.data.inverse_fold = False
+    cfg.data.use_msa = True
+    cfg.data.compute_frames = True
     cfg.model.training_args.diffusion_multiplicity = 1
     cfg.model.training_args.diffusion_samples = 1
 
@@ -163,4 +167,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
