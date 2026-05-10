@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from contextlib import nullcontext
 from itertools import cycle
 from pathlib import Path
@@ -216,10 +217,15 @@ def _score_batch(
 
 
 def _weighted_mean(rows: list[dict[str, float]], key: str) -> float:
-    total = sum(row["n"] for row in rows)
+    usable = [
+        row
+        for row in rows
+        if row["n"] > 0 and math.isfinite(row["n"]) and math.isfinite(row[key])
+    ]
+    total = sum(row["n"] for row in usable)
     if total == 0:
         return float("nan")
-    return sum(row[key] * row["n"] for row in rows) / total
+    return sum(row[key] * row["n"] for row in usable) / total
 
 
 def main() -> None:
@@ -337,11 +343,25 @@ def main() -> None:
                     f"top5={metrics['top5']:.3f} skipped={skipped}"
                 )
 
+    valid_batches = [
+        row
+        for row in batch_metrics
+        if row["n"] > 0 and all(
+            math.isfinite(row[key])
+            for key in ("loss", "top1", "top3", "top5", "entropy", "confidence")
+        )
+    ]
+    zero_residue_batches = sum(row["n"] == 0 for row in batch_metrics)
+    nonfinite_batches = len(batch_metrics) - len(valid_batches) - zero_residue_batches
+
     summary = {
         "checkpoint": str(args.checkpoint),
         "q_head": str(args.q_head),
-        "batches": args.batches,
-        "residues": int(sum(row["n"] for row in batch_metrics)),
+        "requested_batches": args.batches,
+        "valid_batches": len(valid_batches),
+        "zero_residue_batches": zero_residue_batches,
+        "nonfinite_batches": nonfinite_batches,
+        "residues": int(sum(row["n"] for row in valid_batches)),
         "loss": _weighted_mean(batch_metrics, "loss"),
         "top1": _weighted_mean(batch_metrics, "top1"),
         "top3": _weighted_mean(batch_metrics, "top3"),
@@ -350,7 +370,7 @@ def main() -> None:
         "confidence": _weighted_mean(batch_metrics, "confidence"),
         "random_top1_33": 1.0 / 33.0,
         "random_top1_20": 1.0 / 20.0,
-        "skipped_batches": total_skipped,
+        "skipped_attempts": total_skipped,
         "per_batch_csv": str(per_batch_path),
         "per_residue_csv": str(per_residue_path),
     }
@@ -359,6 +379,9 @@ def main() -> None:
 
     print("\nSummary")
     print("-------")
+    print(f"valid batches:  {summary['valid_batches']}/{summary['requested_batches']}")
+    print(f"zero batches:   {summary['zero_residue_batches']}")
+    print(f"bad batches:    {summary['nonfinite_batches']}")
     print(f"residues:       {summary['residues']}")
     print(f"loss:           {summary['loss']:.4f}")
     print(f"top1:           {summary['top1']:.4f}")
@@ -368,7 +391,7 @@ def main() -> None:
     print(f"confidence:     {summary['confidence']:.4f}")
     print(f"random top1/33: {summary['random_top1_33']:.4f}")
     print(f"random top1/20: {summary['random_top1_20']:.4f}")
-    print(f"skipped:        {summary['skipped_batches']}")
+    print(f"skipped:        {summary['skipped_attempts']}")
     print(f"wrote:          {summary_path}")
 
 
