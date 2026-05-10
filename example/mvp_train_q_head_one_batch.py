@@ -93,7 +93,13 @@ def main() -> None:
     cfg.model.training_args.diffusion_multiplicity = 1
     cfg.model.training_args.diffusion_samples = 1
 
-    data_module = TrainingDataModule(cfg.data)
+    data_cfg = hydra.utils.instantiate(
+        OmegaConf.merge(
+            {"_target_": "boltzgen.task.train.data.DataConfig"},
+            cfg.data,
+        )
+    )
+    data_module = TrainingDataModule(data_cfg)
     loader = data_module.train_dataloader()
     batch = next(iter(loader))
     batch = data_module.transfer_batch_to_device(batch, device, dataloader_idx=0)
