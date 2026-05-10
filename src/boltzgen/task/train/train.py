@@ -40,6 +40,7 @@ class Training(Task):
         debug: bool = False,
         strict_loading: bool = True,
         metric_mode: str = "max",
+        trainable_parameter_substrings: Optional[list[str]] = None,
     ) -> None:
         """Initialize training configuration.
 
@@ -87,6 +88,7 @@ class Training(Task):
         self.debug = debug
         self.strict_loading = strict_loading
         self.metric_mode = metric_mode
+        self.trainable_parameter_substrings = trainable_parameter_substrings
 
     def run(self, config: OmegaConf) -> None:
         """Run training.
@@ -139,8 +141,30 @@ class Training(Task):
             file_path = self.pretrained
 
             print(f"Loading model from {file_path}")
-            model_module = type(model_module).load_from_checkpoint(
-                file_path, map_location="cpu", strict=False, weights_only=False, **(model_module.hparams)
+            checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
+            incompatible = model_module.load_state_dict(
+                checkpoint["state_dict"],
+                strict=False,
+            )
+            print(
+                "Loaded pretrained weights with "
+                f"{len(incompatible.missing_keys)} missing and "
+                f"{len(incompatible.unexpected_keys)} unexpected keys."
+            )
+
+        if self.trainable_parameter_substrings:
+            keep = tuple(self.trainable_parameter_substrings)
+            n_trainable = 0
+            n_total = 0
+            for name, param in model_module.named_parameters():
+                n_total += param.numel()
+                param.requires_grad = any(part in name for part in keep)
+                if param.requires_grad:
+                    n_trainable += param.numel()
+            print(
+                "Training only parameters matching "
+                f"{self.trainable_parameter_substrings}: "
+                f"{n_trainable:,}/{n_total:,} parameters"
             )
 
         # Create checkpoint callback
