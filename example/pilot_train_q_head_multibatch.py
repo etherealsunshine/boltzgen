@@ -92,9 +92,11 @@ def _forward_loss(
     precision: str,
 ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor]:
     device = next(model.parameters()).device
+    labels = batch["res_type"].float()
+    model_input = model.masker(batch)
     with _autocast_context(device, precision):
         out = model(
-            batch,
+            model_input,
             recycling_steps=0,
             multiplicity_diffusion_train=1,
             diffusion_samples=1,
@@ -103,7 +105,6 @@ def _forward_loss(
         if logits is None:
             raise RuntimeError("Model returned no res_type logits.")
 
-        target = batch["res_type"].float()
         valid_mask = batch["token_pad_mask"].bool()
         design_mask = batch["design_mask"].bool() & valid_mask
         mask = design_mask if loss_mask == "design" else valid_mask
@@ -111,13 +112,13 @@ def _forward_loss(
             mask = valid_mask
 
         flat_logits = logits.reshape(-1, logits.shape[-1])
-        flat_true = target.argmax(dim=-1).reshape(-1)
+        flat_true = labels.argmax(dim=-1).reshape(-1)
         flat_mask = mask.reshape(-1)
         loss = F.cross_entropy(flat_logits[flat_mask], flat_true[flat_mask])
 
     with torch.no_grad():
         pred = logits.argmax(dim=-1)
-        true = target.argmax(dim=-1)
+        true = labels.argmax(dim=-1)
 
         def acc(selected: torch.Tensor) -> float:
             selected = selected.bool()
