@@ -76,16 +76,26 @@ def _next_usable_batch(
 ) -> tuple[dict, int]:
     skipped = 0
     for _ in range(max_attempts):
-        batch = next(loader_iter)
-        batch = data_module.transfer_batch_to_device(batch, device, dataloader_idx=0)
-        batch = _clone_batch(batch)
+        try:
+            batch = next(loader_iter)
+            batch = data_module.transfer_batch_to_device(
+                batch,
+                device,
+                dataloader_idx=0,
+            )
+            batch = _clone_batch(batch)
+        except Exception as exc:  # noqa: BLE001
+            skipped += 1
+            print(f"skipping failed data batch: {type(exc).__name__}: {exc}")
+            continue
         if _design_token_count(batch) >= min_design_tokens:
             return batch, skipped
         skipped += 1
 
     raise RuntimeError(
         f"Could not find a batch with at least {min_design_tokens} design tokens "
-        f"after {max_attempts} attempts. Try lowering --min-design-tokens."
+        f"after {max_attempts} attempts. Try lowering --min-design-tokens or "
+        "reducing --max-tokens/--max-atoms/--max-seqs."
     )
 
 
@@ -212,9 +222,16 @@ def _save_q_head(model: torch.nn.Module, output_dir: Path, step: int) -> Path:
     return path
 
 
+def _load_q_head(model: torch.nn.Module, q_head_path: Path) -> None:
+    head = model.structure_module.score_model.atom_attention_decoder.res_type_predictor
+    state = torch.load(q_head_path, map_location="cpu", weights_only=False)
+    head.load_state_dict(state)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--init-q-head", type=Path)
     parser.add_argument(
         "--config",
         type=Path,
@@ -253,6 +270,8 @@ def main() -> None:
     model = hydra.utils.instantiate(cfg.model)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    if args.init_q_head is not None:
+        _load_q_head(model, args.init_q_head)
     model.to(device)
     model.train()
 
@@ -267,6 +286,7 @@ def main() -> None:
     print("BoltzGen q-head multi-batch pilot")
     print("=================================")
     print(f"checkpoint:      {args.checkpoint}")
+    print(f"init_q_head:     {args.init_q_head}")
     print(f"device:          {device}")
     print(f"precision:       {args.precision if device.type == 'cuda' else 'fp32'}")
     print(f"steps:           {args.steps}")

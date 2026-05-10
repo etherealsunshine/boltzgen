@@ -107,16 +107,26 @@ def _next_usable_batch(
 ) -> tuple[dict, int]:
     skipped = 0
     for _ in range(max_attempts):
-        batch = next(loader_iter)
-        batch = data_module.transfer_batch_to_device(batch, device, dataloader_idx=0)
-        batch = _clone_batch(batch)
+        try:
+            batch = next(loader_iter)
+            batch = data_module.transfer_batch_to_device(
+                batch,
+                device,
+                dataloader_idx=0,
+            )
+            batch = _clone_batch(batch)
+        except Exception as exc:  # noqa: BLE001
+            skipped += 1
+            print(f"skipping failed data batch: {type(exc).__name__}: {exc}")
+            continue
         if _design_token_count(batch) >= min_design_tokens:
             return batch, skipped
         skipped += 1
 
     raise RuntimeError(
         f"Could not find a batch with at least {min_design_tokens} design tokens "
-        f"after {max_attempts} attempts. Try lowering --min-design-tokens."
+        f"after {max_attempts} attempts. Try lowering --min-design-tokens or "
+        "reducing --max-tokens/--max-atoms/--max-seqs."
     )
 
 
