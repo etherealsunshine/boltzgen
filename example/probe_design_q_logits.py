@@ -6,7 +6,7 @@ residue-level distribution q, ideally `res_type` logits from the diffusion
 proposal path. This script checks the actual checkpoint for:
 
 * hyperparameter `predict_res_type`
-* state_dict parameters for a `res_type_predictor` head
+* state_dict parameters for a residue classifier head
 
 It does not run inference and can be run on CPU after the checkpoint is
 downloaded:
@@ -15,7 +15,7 @@ downloaded:
     python example/probe_design_q_logits.py --checkpoint /path/to/boltzgen1_diverse.ckpt
     python example/probe_design_q_logits.py --checkpoint /path/to/boltzgen1_ifold.ckpt
 
-If `predict_res_type=false` and no `res_type_predictor` weights are present,
+If `predict_res_type=false` and no residue classifier weights are present,
 the design checkpoint cannot provide q logits without adding/training a head.
 """
 
@@ -46,14 +46,23 @@ def probe(checkpoint: Path) -> None:
 
     predict_res_type = _find(hparams, "predict_res_type")
     inverse_fold = _find(hparams, "inverse_fold")
-    head_keys = [
-        key for key in state_dict if "res_type_predictor" in key or key.endswith(".res_type")
+    design_head_keys = [
+        key
+        for key in state_dict
+        if "res_type_predictor" in key or key.endswith(".res_type")
     ]
+    inverse_fold_head_keys = [
+        key
+        for key in state_dict
+        if key.startswith("structure_module.predictor.")
+    ]
+    head_keys = design_head_keys + inverse_fold_head_keys
 
     print(f"checkpoint: {checkpoint}")
     print(f"hyper_parameters.predict_res_type: {predict_res_type}")
     print(f"hyper_parameters.inverse_fold:      {inverse_fold}")
-    print(f"res_type predictor weights found:   {bool(head_keys)}")
+    print(f"design q head weights found:        {bool(design_head_keys)}")
+    print(f"inverse-fold p head weights found:  {bool(inverse_fold_head_keys)}")
 
     if head_keys:
         print("\nmatching state_dict keys:")
@@ -64,9 +73,9 @@ def probe(checkpoint: Path) -> None:
             print(f"  ... {len(head_keys) - 20} more")
 
     print("\ninterpretation:")
-    if inverse_fold is True and head_keys:
+    if inverse_fold is True and inverse_fold_head_keys:
         print("  This looks like an inverse-folding anchor p checkpoint, not design q.")
-    elif predict_res_type is True and head_keys:
+    elif predict_res_type is True and design_head_keys:
         print("  This design checkpoint likely can expose proposal q residue logits.")
     else:
         print("  This checkpoint likely does not expose q logits; add/train a q head.")
