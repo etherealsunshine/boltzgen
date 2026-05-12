@@ -36,6 +36,9 @@ import torch.nn.functional as F
 
 from boltzgen.task.train.data import TrainingDataModule
 
+AA_TOKEN_OFFSET = 2
+AA_TOKEN_COUNT = 20
+
 
 def _clone_batch(batch: dict) -> dict:
     return {
@@ -62,7 +65,11 @@ def _autocast_context(device: torch.device, precision: str):
 
 def _design_token_count(batch: dict) -> int:
     valid_mask = batch["token_pad_mask"].bool()
-    design_mask = batch["design_mask"].bool() & valid_mask
+    true = batch["res_type"].argmax(dim=-1)
+    canonical_mask = (true >= AA_TOKEN_OFFSET) & (
+        true < AA_TOKEN_OFFSET + AA_TOKEN_COUNT
+    )
+    design_mask = batch["design_mask"].bool() & valid_mask & canonical_mask
     return int(design_mask.sum().item())
 
 
@@ -129,6 +136,8 @@ def _forward_loss(
     *,
     loss_mask: str,
     precision: str,
+    label_smoothing: float,
+    include_noncanonical: bool,
 ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor]:
     device = next(model.parameters()).device
     labels = batch["res_type"].float()
@@ -145,19 +154,27 @@ def _forward_loss(
             raise RuntimeError("Model returned no res_type logits.")
 
         valid_mask = batch["token_pad_mask"].bool()
-        design_mask = batch["design_mask"].bool() & valid_mask
-        mask = design_mask if loss_mask == "design" else valid_mask
+        true = labels.argmax(dim=-1)
+        canonical_mask = (true >= AA_TOKEN_OFFSET) & (
+            true < AA_TOKEN_OFFSET + AA_TOKEN_COUNT
+        )
+        label_mask = valid_mask if include_noncanonical else (valid_mask & canonical_mask)
+        design_mask = batch["design_mask"].bool() & label_mask
+        mask = design_mask if loss_mask == "design" else label_mask
         if not mask.any():
-            mask = valid_mask
+            mask = label_mask
 
         flat_logits = logits.reshape(-1, logits.shape[-1])
-        flat_true = labels.argmax(dim=-1).reshape(-1)
+        flat_true = true.reshape(-1)
         flat_mask = mask.reshape(-1)
-        loss = F.cross_entropy(flat_logits[flat_mask], flat_true[flat_mask])
+        loss = F.cross_entropy(
+            flat_logits[flat_mask],
+            flat_true[flat_mask],
+            label_smoothing=label_smoothing,
+        )
 
     with torch.no_grad():
         pred = logits.argmax(dim=-1)
-        true = labels.argmax(dim=-1)
 
         def acc(selected: torch.Tensor) -> float:
             selected = selected.bool()
@@ -167,9 +184,9 @@ def _forward_loss(
 
         metrics = {
             "loss": float(loss.detach().item()),
-            "acc_all": acc(valid_mask),
+            "acc_all": acc(label_mask),
             "acc_design": acc(design_mask),
-            "tokens": float(valid_mask.sum().item()),
+            "tokens": float(label_mask.sum().item()),
             "design_tokens": float(design_mask.sum().item()),
         }
 
@@ -188,6 +205,7 @@ def _evaluate(
     precision: str,
     min_design_tokens: int,
     max_attempts: int,
+    include_noncanonical: bool,
 ) -> dict[str, float]:
     totals: dict[str, float] = {}
     skipped_total = 0
@@ -206,6 +224,8 @@ def _evaluate(
             batch,
             loss_mask=loss_mask,
             precision=precision,
+            label_smoothing=0.0,
+            include_noncanonical=include_noncanonical,
         )
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + value
@@ -253,6 +273,8 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--min-design-tokens", type=int, default=32)
     parser.add_argument("--max-batch-attempts", type=int, default=100)
+    parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--include-noncanonical", action="store_true")
     parser.add_argument("--loss-mask", choices=["design", "valid"], default="design")
     parser.add_argument("--no-msa", action="store_true")
     args = parser.parse_args()
@@ -291,6 +313,8 @@ def main() -> None:
     print(f"precision:       {args.precision if device.type == 'cuda' else 'fp32'}")
     print(f"steps:           {args.steps}")
     print(f"loss_mask:       {args.loss_mask}")
+    print(f"label_smoothing: {args.label_smoothing}")
+    print(f"canonical_only:  {not args.include_noncanonical}")
     print(f"min_design:      {args.min_design_tokens}")
     print(f"max_tokens:      {args.max_tokens}")
     print(f"max_atoms:       {args.max_atoms}")
@@ -331,6 +355,8 @@ def main() -> None:
             batch,
             loss_mask=args.loss_mask,
             precision=args.precision,
+            label_smoothing=args.label_smoothing,
+            include_noncanonical=args.include_noncanonical,
         )
         if step < args.steps:
             loss.backward()
@@ -370,6 +396,7 @@ def main() -> None:
                 precision=args.precision,
                 min_design_tokens=args.min_design_tokens,
                 max_attempts=args.max_batch_attempts,
+                include_noncanonical=args.include_noncanonical,
             )
             print(
                 f"fresh step={step:05d} loss={eval_metrics['eval_loss']:.4f} "

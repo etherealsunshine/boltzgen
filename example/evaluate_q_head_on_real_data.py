@@ -143,6 +143,7 @@ def _score_batch(
     batch: dict,
     *,
     precision: str,
+    temperature: float,
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
     device = next(model.parameters()).device
     labels = batch["res_type"].float()
@@ -176,11 +177,12 @@ def _score_batch(
             "confidence": float("nan"),
         }, []
 
-    selected_logits = logits[mask]
+    selected_logits = logits[mask].float()
     selected_true = true[mask]
-    probs = torch.softmax(selected_logits.float(), dim=-1)
+    scaled_logits = selected_logits / temperature
+    probs = torch.softmax(scaled_logits, dim=-1)
 
-    loss = F.cross_entropy(selected_logits.float(), selected_true)
+    loss = F.cross_entropy(scaled_logits, selected_true)
     topk = torch.topk(probs, k=5, dim=-1)
     pred = topk.indices[:, 0]
     correct = pred == selected_true
@@ -241,6 +243,7 @@ def main() -> None:
     parser.add_argument("--batches", type=int, default=64)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16")
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--max-atoms", type=int, default=2048)
@@ -250,6 +253,8 @@ def main() -> None:
     parser.add_argument("--max-batch-attempts", type=int, default=100)
     parser.add_argument("--no-msa", action="store_true")
     args = parser.parse_args()
+    if args.temperature <= 0:
+        raise SystemExit("--temperature must be positive.")
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -299,6 +304,7 @@ def main() -> None:
     print(f"q_head:          {args.q_head}")
     print(f"device:          {device}")
     print(f"precision:       {args.precision if device.type == 'cuda' else 'fp32'}")
+    print(f"temperature:     {args.temperature}")
     print(f"batches:         {args.batches}")
     print(f"min_design:      {args.min_design_tokens}")
     print(f"missing keys:    {len(incompatible.missing_keys)}")
@@ -327,6 +333,7 @@ def main() -> None:
                 model,
                 batch,
                 precision=args.precision,
+                temperature=args.temperature,
             )
             metrics["skipped_batches"] = float(skipped)
             batch_metrics.append(metrics)
@@ -368,6 +375,7 @@ def main() -> None:
         "top5": _weighted_mean(batch_metrics, "top5"),
         "entropy": _weighted_mean(batch_metrics, "entropy"),
         "confidence": _weighted_mean(batch_metrics, "confidence"),
+        "temperature": args.temperature,
         "random_top1_33": 1.0 / 33.0,
         "random_top1_20": 1.0 / 20.0,
         "skipped_attempts": total_skipped,
