@@ -131,20 +131,17 @@ def _next_usable_batch(
     )
 
 
-def _canonical_mask(true_token: torch.Tensor) -> torch.Tensor:
-    return (true_token >= AA_TOKEN_OFFSET) & (
-        true_token < AA_TOKEN_OFFSET + AA_TOKEN_COUNT
-    )
+def _canonical_mask(token: torch.Tensor) -> torch.Tensor:
+    return (token >= AA_TOKEN_OFFSET) & (token < AA_TOKEN_OFFSET + AA_TOKEN_COUNT)
 
 
 @torch.no_grad()
-def _score_batch(
+def _extract_selected_logits(
     model: torch.nn.Module,
     batch: dict,
     *,
     precision: str,
-    temperature: float,
-) -> tuple[dict[str, float], list[dict[str, float]]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = next(model.parameters()).device
     labels = batch["res_type"].float()
     model_input = model.masker(batch)
@@ -165,8 +162,48 @@ def _score_batch(
     design_mask = batch["design_mask"].bool() & valid_mask
     true = labels.argmax(dim=-1)
     mask = design_mask & _canonical_mask(true)
+    token_index = batch["token_index"][mask].detach().cpu().reshape(-1)
 
     if not mask.any():
+        return (
+            torch.empty(0, logits.shape[-1], device=logits.device),
+            torch.empty(0, dtype=torch.long, device=logits.device),
+            token_index,
+        )
+
+    return logits[mask].float(), true[mask], token_index
+
+
+def _calibration_error(
+    confidence: torch.Tensor,
+    correct: torch.Tensor,
+    *,
+    bins: int = 10,
+) -> float:
+    if confidence.numel() == 0:
+        return float("nan")
+    total = confidence.numel()
+    ece = torch.zeros((), device=confidence.device)
+    for bin_idx in range(bins):
+        low = bin_idx / bins
+        high = (bin_idx + 1) / bins
+        in_bin = (confidence > low) & (confidence <= high)
+        if not in_bin.any():
+            continue
+        bin_conf = confidence[in_bin].mean()
+        bin_acc = correct[in_bin].float().mean()
+        ece = ece + (in_bin.float().sum() / total) * torch.abs(bin_conf - bin_acc)
+    return float(ece.item())
+
+
+def _score_selected_logits(
+    selected_logits: torch.Tensor,
+    selected_true: torch.Tensor,
+    token_index: torch.Tensor,
+    *,
+    temperature: float,
+) -> tuple[dict[str, float], list[dict[str, float]]]:
+    if selected_true.numel() == 0:
         return {
             "n": 0.0,
             "loss": float("nan"),
@@ -175,10 +212,11 @@ def _score_batch(
             "top5": float("nan"),
             "entropy": float("nan"),
             "confidence": float("nan"),
+            "ece": float("nan"),
+            "canonical_mass": float("nan"),
+            "noncanonical_top1": float("nan"),
         }, []
 
-    selected_logits = logits[mask].float()
-    selected_true = true[mask]
     scaled_logits = selected_logits / temperature
     probs = torch.softmax(scaled_logits, dim=-1)
 
@@ -190,9 +228,13 @@ def _score_batch(
     top5 = (topk.indices == selected_true[:, None]).any(dim=-1)
     confidence = topk.values[:, 0]
     entropy = -(probs * torch.log(probs.clamp_min(1e-9))).sum(dim=-1)
+    canonical_mass = probs[:, AA_TOKEN_OFFSET : AA_TOKEN_OFFSET + AA_TOKEN_COUNT].sum(
+        dim=-1,
+    )
+    noncanonical_top1 = ~_canonical_mask(pred)
+    ece = _calibration_error(confidence, correct)
 
     rows = []
-    token_index = batch["token_index"][mask].detach().cpu().reshape(-1)
     for i in range(selected_true.shape[0]):
         rows.append(
             {
@@ -202,6 +244,8 @@ def _score_batch(
                 "correct": float(correct[i].item()),
                 "confidence": float(confidence[i].item()),
                 "entropy": float(entropy[i].item()),
+                "canonical_mass": float(canonical_mass[i].item()),
+                "noncanonical_top1": float(noncanonical_top1[i].float().item()),
                 "nll": float(-torch.log(probs[i, selected_true[i]].clamp_min(1e-9)).item()),
             }
         )
@@ -214,6 +258,9 @@ def _score_batch(
         "top5": float(top5.float().mean().item()),
         "entropy": float(entropy.mean().item()),
         "confidence": float(confidence.mean().item()),
+        "ece": ece,
+        "canonical_mass": float(canonical_mass.mean().item()),
+        "noncanonical_top1": float(noncanonical_top1.float().mean().item()),
     }
     return metrics, rows
 
@@ -230,6 +277,62 @@ def _weighted_mean(rows: list[dict[str, float]], key: str) -> float:
     return sum(row[key] * row["n"] for row in usable) / total
 
 
+def _parse_temperatures(value: str | None, fallback: float) -> list[float]:
+    if value is None:
+        temperatures = [fallback]
+    else:
+        temperatures = [float(item) for item in value.split(",") if item.strip()]
+    if not temperatures:
+        raise SystemExit("At least one temperature is required.")
+    if any(temp <= 0 for temp in temperatures):
+        raise SystemExit("All temperatures must be positive.")
+    return temperatures
+
+
+def _summary_for_temperature(
+    batch_metrics: list[dict[str, float]],
+    *,
+    temperature: float,
+) -> dict[str, float | int]:
+    rows = [row for row in batch_metrics if row["temperature"] == temperature]
+    valid_batches = [
+        row
+        for row in rows
+        if row["n"] > 0 and all(
+            math.isfinite(row[key])
+            for key in (
+                "loss",
+                "top1",
+                "top3",
+                "top5",
+                "entropy",
+                "confidence",
+                "ece",
+                "canonical_mass",
+                "noncanonical_top1",
+            )
+        )
+    ]
+    zero_residue_batches = sum(row["n"] == 0 for row in rows)
+    nonfinite_batches = len(rows) - len(valid_batches) - zero_residue_batches
+    return {
+        "temperature": temperature,
+        "valid_batches": len(valid_batches),
+        "zero_residue_batches": zero_residue_batches,
+        "nonfinite_batches": nonfinite_batches,
+        "residues": int(sum(row["n"] for row in valid_batches)),
+        "loss": _weighted_mean(rows, "loss"),
+        "top1": _weighted_mean(rows, "top1"),
+        "top3": _weighted_mean(rows, "top3"),
+        "top5": _weighted_mean(rows, "top5"),
+        "entropy": _weighted_mean(rows, "entropy"),
+        "confidence": _weighted_mean(rows, "confidence"),
+        "ece": _weighted_mean(rows, "ece"),
+        "canonical_mass": _weighted_mean(rows, "canonical_mass"),
+        "noncanonical_top1": _weighted_mean(rows, "noncanonical_top1"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -244,6 +347,10 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16")
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--temperatures",
+        help="Comma-separated temperature sweep, e.g. 1,2,4,8.",
+    )
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--max-atoms", type=int, default=2048)
@@ -253,8 +360,7 @@ def main() -> None:
     parser.add_argument("--max-batch-attempts", type=int, default=100)
     parser.add_argument("--no-msa", action="store_true")
     args = parser.parse_args()
-    if args.temperature <= 0:
-        raise SystemExit("--temperature must be positive.")
+    temperatures = _parse_temperatures(args.temperatures, args.temperature)
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -278,6 +384,7 @@ def main() -> None:
 
     batch_fieldnames = [
         "batch",
+        "temperature",
         "n",
         "loss",
         "top1",
@@ -285,16 +392,22 @@ def main() -> None:
         "top5",
         "entropy",
         "confidence",
+        "ece",
+        "canonical_mass",
+        "noncanonical_top1",
         "skipped_batches",
     ]
     residue_fieldnames = [
         "batch",
+        "temperature",
         "token_index",
         "true_token",
         "pred_token",
         "correct",
         "confidence",
         "entropy",
+        "canonical_mass",
+        "noncanonical_top1",
         "nll",
     ]
 
@@ -304,7 +417,7 @@ def main() -> None:
     print(f"q_head:          {args.q_head}")
     print(f"device:          {device}")
     print(f"precision:       {args.precision if device.type == 'cuda' else 'fp32'}")
-    print(f"temperature:     {args.temperature}")
+    print(f"temperatures:    {temperatures}")
     print(f"batches:         {args.batches}")
     print(f"min_design:      {args.min_design_tokens}")
     print(f"missing keys:    {len(incompatible.missing_keys)}")
@@ -329,53 +442,57 @@ def main() -> None:
                 max_attempts=args.max_batch_attempts,
             )
             total_skipped += skipped
-            metrics, residue_rows = _score_batch(
+            selected_logits, selected_true, token_index = _extract_selected_logits(
                 model,
                 batch,
                 precision=args.precision,
-                temperature=args.temperature,
             )
-            metrics["skipped_batches"] = float(skipped)
-            batch_metrics.append(metrics)
-            batch_writer.writerow({"batch": batch_idx, **metrics})
+            metrics_by_temp = {}
+            for temperature in temperatures:
+                metrics, residue_rows = _score_selected_logits(
+                    selected_logits,
+                    selected_true,
+                    token_index,
+                    temperature=temperature,
+                )
+                metrics["temperature"] = temperature
+                metrics["skipped_batches"] = float(skipped)
+                batch_metrics.append(metrics)
+                metrics_by_temp[temperature] = metrics
+                batch_writer.writerow({"batch": batch_idx, **metrics})
 
-            for row in residue_rows:
-                residue_writer.writerow({"batch": batch_idx, **row})
+                for row in residue_rows:
+                    residue_writer.writerow(
+                        {"batch": batch_idx, "temperature": temperature, **row},
+                    )
 
             if batch_idx == 0 or (batch_idx + 1) % 10 == 0 or batch_idx + 1 == args.batches:
+                metrics = metrics_by_temp[temperatures[0]]
                 print(
                     f"batch={batch_idx + 1:04d}/{args.batches} "
-                    f"n={int(metrics['n'])} loss={metrics['loss']:.4f} "
+                    f"T={temperatures[0]:g} n={int(metrics['n'])} "
+                    f"loss={metrics['loss']:.4f} "
                     f"top1={metrics['top1']:.3f} top3={metrics['top3']:.3f} "
                     f"top5={metrics['top5']:.3f} skipped={skipped}"
                 )
 
-    valid_batches = [
-        row
-        for row in batch_metrics
-        if row["n"] > 0 and all(
-            math.isfinite(row[key])
-            for key in ("loss", "top1", "top3", "top5", "entropy", "confidence")
+    summaries = {
+        str(temperature): _summary_for_temperature(
+            batch_metrics,
+            temperature=temperature,
         )
-    ]
-    zero_residue_batches = sum(row["n"] == 0 for row in batch_metrics)
-    nonfinite_batches = len(batch_metrics) - len(valid_batches) - zero_residue_batches
+        for temperature in temperatures
+    }
+    primary = summaries[str(temperatures[0])]
 
     summary = {
         "checkpoint": str(args.checkpoint),
         "q_head": str(args.q_head),
         "requested_batches": args.batches,
-        "valid_batches": len(valid_batches),
-        "zero_residue_batches": zero_residue_batches,
-        "nonfinite_batches": nonfinite_batches,
-        "residues": int(sum(row["n"] for row in valid_batches)),
-        "loss": _weighted_mean(batch_metrics, "loss"),
-        "top1": _weighted_mean(batch_metrics, "top1"),
-        "top3": _weighted_mean(batch_metrics, "top3"),
-        "top5": _weighted_mean(batch_metrics, "top5"),
-        "entropy": _weighted_mean(batch_metrics, "entropy"),
-        "confidence": _weighted_mean(batch_metrics, "confidence"),
-        "temperature": args.temperature,
+        "temperatures": temperatures,
+        "primary_temperature": temperatures[0],
+        **primary,
+        "temperature_summaries": summaries,
         "random_top1_33": 1.0 / 33.0,
         "random_top1_20": 1.0 / 20.0,
         "skipped_attempts": total_skipped,
@@ -387,16 +504,20 @@ def main() -> None:
 
     print("\nSummary")
     print("-------")
-    print(f"valid batches:  {summary['valid_batches']}/{summary['requested_batches']}")
-    print(f"zero batches:   {summary['zero_residue_batches']}")
-    print(f"bad batches:    {summary['nonfinite_batches']}")
-    print(f"residues:       {summary['residues']}")
-    print(f"loss:           {summary['loss']:.4f}")
-    print(f"top1:           {summary['top1']:.4f}")
-    print(f"top3:           {summary['top3']:.4f}")
-    print(f"top5:           {summary['top5']:.4f}")
-    print(f"entropy:        {summary['entropy']:.4f}")
-    print(f"confidence:     {summary['confidence']:.4f}")
+    for temperature in temperatures:
+        temp_summary = summaries[str(temperature)]
+        print(
+            f"T={temperature:g} "
+            f"valid={temp_summary['valid_batches']}/{summary['requested_batches']} "
+            f"res={temp_summary['residues']} loss={temp_summary['loss']:.4f} "
+            f"top1={temp_summary['top1']:.4f} "
+            f"top3={temp_summary['top3']:.4f} "
+            f"top5={temp_summary['top5']:.4f} "
+            f"conf={temp_summary['confidence']:.4f} "
+            f"ece={temp_summary['ece']:.4f} "
+            f"canon={temp_summary['canonical_mass']:.4f} "
+            f"noncanon_top1={temp_summary['noncanonical_top1']:.4f}"
+        )
     print(f"random top1/33: {summary['random_top1_33']:.4f}")
     print(f"random top1/20: {summary['random_top1_20']:.4f}")
     print(f"skipped:        {summary['skipped_attempts']}")
