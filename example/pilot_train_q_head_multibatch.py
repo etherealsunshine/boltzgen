@@ -32,12 +32,15 @@ import time
 import hydra
 from omegaconf import OmegaConf
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 from boltzgen.task.train.data import TrainingDataModule
 
 AA_TOKEN_OFFSET = 2
 AA_TOKEN_COUNT = 20
+Q_HEAD_IN_DIM = 128
+Q_HEAD_OUT_DIM = 33
 
 
 def _clone_batch(batch: dict) -> dict:
@@ -54,6 +57,40 @@ def _freeze_except_q_head(model: torch.nn.Module) -> list[torch.nn.Parameter]:
         if param.requires_grad:
             params.append(param)
     return params
+
+
+def _get_q_head(model: torch.nn.Module) -> torch.nn.Module:
+    return model.structure_module.score_model.atom_attention_decoder.res_type_predictor
+
+
+def _set_q_head(model: torch.nn.Module, head: torch.nn.Module) -> None:
+    model.structure_module.score_model.atom_attention_decoder.res_type_predictor = head
+
+
+def _configure_q_head(model: torch.nn.Module, args: argparse.Namespace) -> None:
+    if args.q_head_arch == "linear":
+        return
+    if args.q_head_arch != "mlp":
+        raise ValueError(f"Unknown q head architecture: {args.q_head_arch}")
+    _set_q_head(
+        model,
+        nn.Sequential(
+            nn.LayerNorm(Q_HEAD_IN_DIM),
+            nn.Linear(Q_HEAD_IN_DIM, args.q_head_hidden),
+            nn.SiLU(),
+            nn.Dropout(args.q_head_dropout),
+            nn.Linear(args.q_head_hidden, Q_HEAD_OUT_DIM),
+        ),
+    )
+
+
+def _mask_to_canonical_logits(logits: torch.Tensor) -> torch.Tensor:
+    masked = torch.full_like(logits, -1.0e4)
+    masked[..., AA_TOKEN_OFFSET : AA_TOKEN_OFFSET + AA_TOKEN_COUNT] = logits[
+        ...,
+        AA_TOKEN_OFFSET : AA_TOKEN_OFFSET + AA_TOKEN_COUNT,
+    ]
+    return masked
 
 
 def _autocast_context(device: torch.device, precision: str):
@@ -138,6 +175,7 @@ def _forward_loss(
     precision: str,
     label_smoothing: float,
     include_noncanonical: bool,
+    canonical_logits_only: bool,
 ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor]:
     device = next(model.parameters()).device
     labels = batch["res_type"].float()
@@ -152,6 +190,8 @@ def _forward_loss(
         logits = out["res_type"]
         if logits is None:
             raise RuntimeError("Model returned no res_type logits.")
+        if canonical_logits_only:
+            logits = _mask_to_canonical_logits(logits)
 
         valid_mask = batch["token_pad_mask"].bool()
         true = labels.argmax(dim=-1)
@@ -206,6 +246,7 @@ def _evaluate(
     min_design_tokens: int,
     max_attempts: int,
     include_noncanonical: bool,
+    canonical_logits_only: bool,
 ) -> dict[str, float]:
     totals: dict[str, float] = {}
     skipped_total = 0
@@ -226,6 +267,7 @@ def _evaluate(
             precision=precision,
             label_smoothing=0.0,
             include_noncanonical=include_noncanonical,
+            canonical_logits_only=canonical_logits_only,
         )
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + value
@@ -236,14 +278,14 @@ def _evaluate(
 
 def _save_q_head(model: torch.nn.Module, output_dir: Path, step: int) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    head = model.structure_module.score_model.atom_attention_decoder.res_type_predictor
+    head = _get_q_head(model)
     path = output_dir / f"q_head_step{step}.pt"
     torch.save(head.state_dict(), path)
     return path
 
 
 def _load_q_head(model: torch.nn.Module, q_head_path: Path) -> None:
-    head = model.structure_module.score_model.atom_attention_decoder.res_type_predictor
+    head = _get_q_head(model)
     state = torch.load(q_head_path, map_location="cpu", weights_only=False)
     head.load_state_dict(state)
 
@@ -273,7 +315,11 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--min-design-tokens", type=int, default=32)
     parser.add_argument("--max-batch-attempts", type=int, default=100)
+    parser.add_argument("--q-head-arch", choices=["linear", "mlp"], default="linear")
+    parser.add_argument("--q-head-hidden", type=int, default=256)
+    parser.add_argument("--q-head-dropout", type=float, default=0.05)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--canonical-logits-only", action="store_true")
     parser.add_argument("--include-noncanonical", action="store_true")
     parser.add_argument("--loss-mask", choices=["design", "valid"], default="design")
     parser.add_argument("--no-msa", action="store_true")
@@ -292,6 +338,7 @@ def main() -> None:
     model = hydra.utils.instantiate(cfg.model)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    _configure_q_head(model, args)
     if args.init_q_head is not None:
         _load_q_head(model, args.init_q_head)
     model.to(device)
@@ -313,8 +360,13 @@ def main() -> None:
     print(f"precision:       {args.precision if device.type == 'cuda' else 'fp32'}")
     print(f"steps:           {args.steps}")
     print(f"loss_mask:       {args.loss_mask}")
+    print(f"q_head_arch:     {args.q_head_arch}")
+    if args.q_head_arch == "mlp":
+        print(f"q_head_hidden:   {args.q_head_hidden}")
+        print(f"q_head_dropout:  {args.q_head_dropout}")
     print(f"label_smoothing: {args.label_smoothing}")
     print(f"canonical_only:  {not args.include_noncanonical}")
+    print(f"canon_logits:    {args.canonical_logits_only}")
     print(f"min_design:      {args.min_design_tokens}")
     print(f"max_tokens:      {args.max_tokens}")
     print(f"max_atoms:       {args.max_atoms}")
@@ -357,6 +409,7 @@ def main() -> None:
             precision=args.precision,
             label_smoothing=args.label_smoothing,
             include_noncanonical=args.include_noncanonical,
+            canonical_logits_only=args.canonical_logits_only,
         )
         if step < args.steps:
             loss.backward()
@@ -397,6 +450,7 @@ def main() -> None:
                 min_design_tokens=args.min_design_tokens,
                 max_attempts=args.max_batch_attempts,
                 include_noncanonical=args.include_noncanonical,
+                canonical_logits_only=args.canonical_logits_only,
             )
             print(
                 f"fresh step={step:05d} loss={eval_metrics['eval_loss']:.4f} "

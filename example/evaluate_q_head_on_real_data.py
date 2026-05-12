@@ -39,6 +39,7 @@ from pathlib import Path
 import hydra
 from omegaconf import OmegaConf
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 from boltzgen.task.train.data import TrainingDataModule
@@ -46,6 +47,8 @@ from boltzgen.task.train.data import TrainingDataModule
 
 AA_TOKEN_OFFSET = 2
 AA_TOKEN_COUNT = 20
+Q_HEAD_IN_DIM = 128
+Q_HEAD_OUT_DIM = 33
 
 
 def _clone_batch(batch: dict) -> dict:
@@ -86,15 +89,41 @@ def _make_data_config(cfg: OmegaConf, args: argparse.Namespace):
     )
 
 
+def _get_q_head(model: torch.nn.Module) -> torch.nn.Module:
+    return model.structure_module.score_model.atom_attention_decoder.res_type_predictor
+
+
+def _set_q_head(model: torch.nn.Module, head: torch.nn.Module) -> None:
+    model.structure_module.score_model.atom_attention_decoder.res_type_predictor = head
+
+
+def _configure_q_head(model: torch.nn.Module, args: argparse.Namespace) -> None:
+    if args.q_head_arch == "linear":
+        return
+    if args.q_head_arch != "mlp":
+        raise ValueError(f"Unknown q head architecture: {args.q_head_arch}")
+    _set_q_head(
+        model,
+        nn.Sequential(
+            nn.LayerNorm(Q_HEAD_IN_DIM),
+            nn.Linear(Q_HEAD_IN_DIM, args.q_head_hidden),
+            nn.SiLU(),
+            nn.Dropout(args.q_head_dropout),
+            nn.Linear(args.q_head_hidden, Q_HEAD_OUT_DIM),
+        ),
+    )
+
+
 def _load_q_head(model: torch.nn.Module, q_head_path: Path) -> None:
-    head = model.structure_module.score_model.atom_attention_decoder.res_type_predictor
+    head = _get_q_head(model)
     state = torch.load(q_head_path, map_location="cpu", weights_only=False)
     head.load_state_dict(state)
 
 
 def _design_token_count(batch: dict) -> int:
     valid_mask = batch["token_pad_mask"].bool()
-    design_mask = batch["design_mask"].bool() & valid_mask
+    true = batch["res_type"].argmax(dim=-1)
+    design_mask = batch["design_mask"].bool() & valid_mask & _canonical_mask(true)
     return int(design_mask.sum().item())
 
 
@@ -135,12 +164,22 @@ def _canonical_mask(token: torch.Tensor) -> torch.Tensor:
     return (token >= AA_TOKEN_OFFSET) & (token < AA_TOKEN_OFFSET + AA_TOKEN_COUNT)
 
 
+def _mask_to_canonical_logits(logits: torch.Tensor) -> torch.Tensor:
+    masked = torch.full_like(logits, -1.0e4)
+    masked[..., AA_TOKEN_OFFSET : AA_TOKEN_OFFSET + AA_TOKEN_COUNT] = logits[
+        ...,
+        AA_TOKEN_OFFSET : AA_TOKEN_OFFSET + AA_TOKEN_COUNT,
+    ]
+    return masked
+
+
 @torch.no_grad()
 def _extract_selected_logits(
     model: torch.nn.Module,
     batch: dict,
     *,
     precision: str,
+    canonical_logits_only: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = next(model.parameters()).device
     labels = batch["res_type"].float()
@@ -157,6 +196,8 @@ def _extract_selected_logits(
 
     if logits is None:
         raise RuntimeError("Model returned no res_type logits.")
+    if canonical_logits_only:
+        logits = _mask_to_canonical_logits(logits)
 
     valid_mask = batch["token_pad_mask"].bool()
     design_mask = batch["design_mask"].bool() & valid_mask
@@ -358,6 +399,10 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--min-design-tokens", type=int, default=32)
     parser.add_argument("--max-batch-attempts", type=int, default=100)
+    parser.add_argument("--q-head-arch", choices=["linear", "mlp"], default="linear")
+    parser.add_argument("--q-head-hidden", type=int, default=256)
+    parser.add_argument("--q-head-dropout", type=float, default=0.05)
+    parser.add_argument("--canonical-logits-only", action="store_true")
     parser.add_argument("--no-msa", action="store_true")
     args = parser.parse_args()
     temperatures = _parse_temperatures(args.temperatures, args.temperature)
@@ -373,9 +418,11 @@ def main() -> None:
     model = hydra.utils.instantiate(cfg.model)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    _configure_q_head(model, args)
     _load_q_head(model, args.q_head)
     model.to(device)
     model.train()
+    _get_q_head(model).eval()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     per_batch_path = args.output_dir / "q_head_eval_batches.csv"
@@ -418,6 +465,8 @@ def main() -> None:
     print(f"device:          {device}")
     print(f"precision:       {args.precision if device.type == 'cuda' else 'fp32'}")
     print(f"temperatures:    {temperatures}")
+    print(f"q_head_arch:     {args.q_head_arch}")
+    print(f"canon_logits:    {args.canonical_logits_only}")
     print(f"batches:         {args.batches}")
     print(f"min_design:      {args.min_design_tokens}")
     print(f"missing keys:    {len(incompatible.missing_keys)}")
@@ -446,6 +495,7 @@ def main() -> None:
                 model,
                 batch,
                 precision=args.precision,
+                canonical_logits_only=args.canonical_logits_only,
             )
             metrics_by_temp = {}
             for temperature in temperatures:
